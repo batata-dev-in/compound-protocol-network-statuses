@@ -1,32 +1,45 @@
-const protocolData = window.protocolData;
+/**
+ * Optimized Compound Protocol Data Fetcher
+ * * Improvements:
+ * 1. Removed Array.prototype pollution (replaced with modern async loops).
+ * 2. Instantiated Web3 once per network instead of per token.
+ * 3. Batched DOM updates to prevent layout thrashing.
+ * 4. Improved error handling and configuration management.
+ */
+
+// ----------------------------------------------------------------------------
+// Configuration & Constants
+// ----------------------------------------------------------------------------
+
+const CONFIG = {
+  infuraId: '7db01e82204d4e789e22cf8e4f640ebe', // Consider moving to env variable
+  endpoints: {
+    cToken: 'https://api.compound.finance/api/v2/ctoken'
+  }
+};
+
+// Dependency check
+if (!window.protocolData || !window.erc20cTokenAbi || !window.comptrollerAbi) {
+  console.error("Missing required global data (protocolData or ABIs).");
+}
+
+const protocolData = window.protocolData || {};
 const erc20cTokenAbi = window.erc20cTokenAbi;
 const comptrollerAbi = window.comptrollerAbi;
 const networks = Object.keys(protocolData);
-const cTokenEndpoint = 'https://api.compound.finance/api/v2/ctoken';
-const infuraApiKey = '7db01e82204d4e789e22cf8e4f640ebe'
-let web3;
 
-const numbFormat = new Intl.NumberFormat('en-US', {
+// Initialize Intl formatter once
+const currencyFormatter = new Intl.NumberFormat('en-US', {
   minimumFractionDigits: 4,
   maximumFractionDigits: 18
-}).format;
+});
 
-Array.prototype.forEachWithCallback = function(callback, final) {
-  const arrayCopy = JSON.parse(JSON.stringify(this));
-  let index = -1;
-  const next = () => {
-    index++;
-    if (arrayCopy.length > 0) {
-      callback(arrayCopy.shift(), index, next);
-    } else {
-      if (final) final();
-    }
-  }
-  next();
-}
+// ----------------------------------------------------------------------------
+// Templates
+// ----------------------------------------------------------------------------
 
 const tableTemplate = Handlebars.compile(`
-  <div class="max-width center">
+  <div class="max-width center" id="table-{{ uniqueId }}">
     <h3>{{ name }}</h3>
     <div>
       <table class="table">
@@ -111,127 +124,149 @@ const networkTemplate = Handlebars.compile(`
     <div class="loading-table">
       <div class="loader"></div>
     </div>
-    <div></div>
+    <div class="tables-container"></div>
   </div>
 `);
 
-const assetTemplate = Handlebars.compile(`
-  <div id="{{ this }}"></div>
-`);
+// ----------------------------------------------------------------------------
+// Core Logic
+// ----------------------------------------------------------------------------
 
-const scrollTop = document.getElementById('scroll-top');
-scrollTop.onclick = () => { window.scrollTo(0, 0) };
+// Setup Scroll Handler
+const scrollTopBtn = document.getElementById('scroll-top');
+if (scrollTopBtn) {
+  scrollTopBtn.addEventListener('click', () => window.scrollTo(0, 0));
+}
 
 window.addEventListener('load', async () => {
   const navigation = document.getElementById('navigation');
   const networksContainer = document.getElementById('networks-container');
-  let networksHtml = '';
-  networks.forEach((net) => {
-    networksHtml += networkTemplate(net);
-  });
-  networksContainer.innerHTML = networksHtml;
+  
+  if (!networksContainer) return;
 
-  networks.forEach((net) => {
-    const networkContainer = document.getElementById(net);
-    const loadingElement = networkContainer.children[0];
-    const tablesContainer = networkContainer.children[1];
+  // 1. Render Network Skeletons
+  networksContainer.innerHTML = networks.map(net => networkTemplate(net)).join('');
 
-    let tablesHtml = '';
-    protocolData[net].cTokens.forEach((cToken, i) => {
-      const symbol = cToken.symbol;
-      tablesHtml += assetTemplate(`${net}-${symbol}`);
-    });
-
-    tablesContainer.innerHTML = tablesHtml;
-
-    protocolData[net].cTokens.forEachWithCallback(async (cToken, index, done) => {
-      const comptrollerAddr = protocolData[net].comptroller;
-      const cTokenAddr = cToken.token_address;
-      const symbol = cToken.symbol;
-      try {
-        const data = await getCTokenData(net, cTokenAddr, comptrollerAddr, symbol);
-        data.name = cToken.name;
-        loadingElement.classList.add('hidden');
-        tablesContainer.children[`${net}-${symbol}`].innerHTML += tableTemplate(data);
-
-        const nav = document.createElement("A");
-        nav.href = `#${net}-${symbol}`
-        nav.innerText = `${net} - ${symbol}`
-        navigation.appendChild(nav);
-        navigation.appendChild(document.createElement("BR"));
-      } catch (e) {
-        console.error(`${net} ${symbol}:`, e);
-      }
-      done();
-    });
-  });
+  // 2. Process each network
+  for (const net of networks) {
+    await processNetwork(net, navigation);
+  }
 });
 
-const getCTokenData = (network, cTokenAddr, comptrollerAddr, symbol) => {
-  return new Promise(async (resolve, reject) => {
+async function processNetwork(networkName, navContainer) {
+  const networkData = protocolData[networkName];
+  const networkContainer = document.getElementById(networkName);
+  const loadingElement = networkContainer.querySelector('.loading-table');
+  const tablesContainer = networkContainer.querySelector('.tables-container');
+  
+  // Initialize Web3 ONCE per network
+  const web3Instance = new Web3(`https://${networkName}.infura.io/v3/${CONFIG.infuraId}`);
+  const comptrollerContract = new web3Instance.eth.Contract(comptrollerAbi, networkData.comptroller);
+
+  // Create a DocumentFragment to batch DOM updates (Performance boost)
+  const docFragment = document.createDocumentFragment();
+  const navFragment = document.createDocumentFragment();
+
+  // Use modern for...of loop instead of recursive callbacks
+  // Allows for sequential execution to avoid rate-limiting, or use Promise.all for parallel
+  for (const cToken of networkData.cTokens) {
+    const symbol = cToken.symbol;
+    const uniqueId = `${networkName}-${symbol}`;
+
     try {
-      web3 = new Web3(`https://${network}.infura.io/v3/${infuraApiKey}`);
-      const cToken = new web3.eth.Contract(erc20cTokenAbi, cTokenAddr);
-      const comptroller = new web3.eth.Contract(comptrollerAbi, comptrollerAddr);
+      // Create placeholder in container if needed, or just append result later
+      const data = await fetchCTokenData(
+        web3Instance,
+        cToken.token_address,
+        comptrollerContract,
+        symbol
+      );
+      
+      data.name = cToken.name;
+      data.uniqueId = uniqueId;
 
-      const exchangeRateCurrent = await cToken.methods.exchangeRateCurrent().call();
-      const liquidityPoolTotal  = await cToken.methods.getCash().call();
-      const totalBorrowsCurrent = await cToken.methods.totalBorrowsCurrent().call();
-      const borrowRatePerBlock  = await cToken.methods.borrowRatePerBlock().call();
-      const totalSupply         = await cToken.methods.totalSupply().call();
-      const supplyRatePerBlock  = await cToken.methods.supplyRatePerBlock().call();
-      const totalReserves       = await cToken.methods.totalReserves().call();
-      const reserveFactor       = await cToken.methods.reserveFactorMantissa().call();
-      const collateralFactor    = await comptroller.methods.markets(cTokenAddr).call();
-      const cTokenDecimals      = await cToken.methods.decimals().call();
-      const cTokenMantissa      = parseFloat('1e'+cTokenDecimals);
-      const underlyingAddress   = await cToken.methods.underlying().call();
+      // Create temporary container for HTML string
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = tableTemplate(data);
+      docFragment.appendChild(tempDiv);
 
-      // const closeFactorMantissa = await comptroller.methods.closeFactorMantissa().call();
-      // const liquidationIncentiveMantissa = await comptroller.methods.liquidationIncentiveMantissa().call();
+      // Update Navigation
+      const navLink = document.createElement("a");
+      navLink.href = `#${uniqueId}`;
+      navLink.innerText = `${networkName} - ${symbol}`;
+      navFragment.appendChild(navLink);
+      navFragment.appendChild(document.createElement("br"));
 
-      const result = {
-        exchangeRateCurrent,
-        liquidityPoolTotal,
-        totalBorrowsCurrent,
-        borrowRatePerBlock,
-        totalSupply,
-        supplyRatePerBlock,
-        totalReserves,
-        reserveFactor,
-        collateralFactor,
-        cTokenDecimals,
-        underlyingAddress,
-        textExchangeRate: `1 c${symbol} = ${numbFormat(exchangeRateCurrent / 1e18 / 1e10)} ${symbol}`,
-        textContractHoldings: `${numbFormat(liquidityPoolTotal / 1e18)} ${symbol}`,
-        textOpenBorrows: `${numbFormat(totalBorrowsCurrent / 1e18)} ${symbol}`,
-        textSupplyRate: `${(supplyRatePerBlock / 1e18).toFixed(18)} ${symbol} per ${symbol} supplied`,
-        textBorrowRate: `${(borrowRatePerBlock / 1e18).toFixed(18)} ${symbol} per ${symbol} borrowed`,
-        textCTokenCirculation: `${numbFormat(totalSupply / cTokenMantissa)} c${symbol}`,
-        textReservesSum: `${numbFormat(totalReserves / 1e18)} ${symbol}`,
-        textReserveFactor: `${reserveFactor / 1e18 * 100}%`,
-        textCollateralFactor: `${collateralFactor.collateralFactorMantissa / 1e18 * 100}%`,
-        textcTokenMantissa: cTokenMantissa
-      }
-
-      console.log(`
-        ~~ ${network} ~~ ${symbol} ~~
-        Current Exchange Rate: ${result.textExchangeRate}
-        ${symbol} in contract:       ${result.textContractHoldings}
-        Open Borrows Sum:      ${result.textOpenBorrows}
-        Supply Rate / Block:   ${result.textSupplyRate}
-        Borrow Rate / Block:   ${result.textBorrowRate}
-        c${symbol} in circulation:   ${result.textCTokenCirculation}
-        Reserves:              ${result.textReservesSum}
-        Reserve Factor:        ${result.textReserveFactor}
-        Collateral Factor:     ${result.textCollateralFactor}
-        cToken Mantissa:       ${cTokenMantissa}
-        Underlying Address:    ${underlyingAddress}
-      `);
-
-      resolve(result);
     } catch (e) {
-      reject(e);
+      console.error(`Failed to fetch data for ${networkName} ${symbol}:`, e);
     }
-  });
-};
+  }
+
+  // Final DOM Update for this network
+  loadingElement.classList.add('hidden');
+  tablesContainer.appendChild(docFragment);
+  if (navContainer) {
+    navContainer.appendChild(navFragment);
+  }
+}
+
+async function fetchCTokenData(web3, cTokenAddr, comptrollerContract, symbol) {
+  const cTokenContract = new web3.eth.Contract(erc20cTokenAbi, cTokenAddr);
+
+  // Parallel execution of independent read calls
+  const [
+    exchangeRateCurrent,
+    liquidityPoolTotal,
+    totalBorrowsCurrent,
+    borrowRatePerBlock,
+    totalSupply,
+    supplyRatePerBlock,
+    totalReserves,
+    reserveFactor,
+    collateralFactor,
+    cTokenDecimals,
+    underlyingAddress
+  ] = await Promise.all([
+    cTokenContract.methods.exchangeRateCurrent().call(),
+    cTokenContract.methods.getCash().call(),
+    cTokenContract.methods.totalBorrowsCurrent().call(),
+    cTokenContract.methods.borrowRatePerBlock().call(),
+    cTokenContract.methods.totalSupply().call(),
+    cTokenContract.methods.supplyRatePerBlock().call(),
+    cTokenContract.methods.totalReserves().call(),
+    cTokenContract.methods.reserveFactorMantissa().call(),
+    comptrollerContract.methods.markets(cTokenAddr).call(),
+    cTokenContract.methods.decimals().call(),
+    cTokenContract.methods.underlying().call().catch(() => 'N/A') // Handle tokens without underlying (e.g. cETH sometimes differs)
+  ]);
+
+  const cTokenMantissa = parseFloat('1e' + cTokenDecimals);
+  
+  // Note: Assuming 18 decimals for underlying in formatted text. 
+  // For production, fetch underlying decimals dynamically.
+  const standardMantissa = 1e18; 
+
+  return {
+    exchangeRateCurrent,
+    liquidityPoolTotal,
+    totalBorrowsCurrent,
+    borrowRatePerBlock,
+    totalSupply,
+    supplyRatePerBlock,
+    totalReserves,
+    reserveFactor,
+    collateralFactor,
+    cTokenDecimals,
+    underlyingAddress,
+    textExchangeRate: `1 c${symbol} = ${currencyFormatter.format(exchangeRateCurrent / standardMantissa / 1e10)} ${symbol}`,
+    textContractHoldings: `${currencyFormatter.format(liquidityPoolTotal / standardMantissa)} ${symbol}`,
+    textOpenBorrows: `${currencyFormatter.format(totalBorrowsCurrent / standardMantissa)} ${symbol}`,
+    textSupplyRate: `${(supplyRatePerBlock / standardMantissa).toFixed(18)} ${symbol} per ${symbol} supplied`,
+    textBorrowRate: `${(borrowRatePerBlock / standardMantissa).toFixed(18)} ${symbol} per ${symbol} borrowed`,
+    textCTokenCirculation: `${currencyFormatter.format(totalSupply / cTokenMantissa)} c${symbol}`,
+    textReservesSum: `${currencyFormatter.format(totalReserves / standardMantissa)} ${symbol}`,
+    textReserveFactor: `${reserveFactor / standardMantissa * 100}%`,
+    textCollateralFactor: `${collateralFactor.collateralFactorMantissa / standardMantissa * 100}%`,
+    textcTokenMantissa: cTokenMantissa
+  };
+}
